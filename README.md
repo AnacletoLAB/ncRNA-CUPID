@@ -25,6 +25,3 @@ Firstly, download the checkpoint of the foundational RNA Language model (GenerRN
 ├── tokenizer        # BPE tokenizer of the foundational RNA LM
 ├── example_notebook.py # Example usage of ncRNA cupid for training on your set of ncRNA interaction sequences
 ```
-
-# License
-TO-DO
