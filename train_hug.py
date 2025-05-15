@@ -96,7 +96,7 @@ def main(
     torch.manual_seed(seed)
 
     pickle_file = 'db_strat/classification_aug_types_training.p'
-    arrow_dir = 'data/arrow_dataset_full'
+    arrow_dir = 'data/arrow_dataset_100k'
 
     if not os.path.exists(arrow_dir):
         print('Building dataset')
@@ -133,7 +133,7 @@ def main(
     steps_per_epoch = ((total + batch_size - 1) // batch_size)
 
     training_args = TrainingArguments(
-        output_dir='./hf_rna_cross_full',
+        output_dir='./hf_rna_cross_newmodel100ktest',
         per_device_train_batch_size=batch_size,
         per_device_eval_batch_size=batch_size,
         learning_rate=5e-4,
@@ -164,7 +164,7 @@ def main(
     print('Begin Training')
     free_memory()
     trainer.train()
-    print('Training complete. Best model in hf_rna_cross/best_model')
+    print(f'Training complete. Best model in {output_dir}')
 
 
 if __name__ == '__main__':
