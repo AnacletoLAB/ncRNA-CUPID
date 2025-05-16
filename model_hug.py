@@ -1,4 +1,3 @@
-
 import torch
 import torch.nn as nn
 from dataclasses import dataclass
@@ -118,3 +117,4 @@ class RNACrossAttentionHF(PreTrainedModel):
             return summed / count
         else:
             return x.mean(dim=1)
+

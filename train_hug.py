@@ -9,6 +9,10 @@ from dataset_hug import build_arrow_from_pickle, load_arrow_dataset
 from model_hug import RNACrossAttentionHF, RNACrossAttentionConfig
 import gc
 
+
+os.environ["CUDA_DEVICE_ORDER"]="PCI_BUS_ID"
+os.environ["CUDA_VISIBLE_DEVICES"]="1"
+
 def free_memory():
     """
     Frees up unused GPU and CPU memory.
@@ -96,7 +100,7 @@ def main(
     torch.manual_seed(seed)
 
     pickle_file = 'db_strat/classification_aug_types_training.p'
-    arrow_dir = 'data/arrow_dataset_100k'
+    arrow_dir = 'data/arrow_dataset_full'
 
     if not os.path.exists(arrow_dir):
         print('Building dataset')
@@ -133,7 +137,7 @@ def main(
     steps_per_epoch = ((total + batch_size - 1) // batch_size)
 
     training_args = TrainingArguments(
-        output_dir='./hf_rna_cross_newmodel100ktest',
+        output_dir='./hf_rna_cross_full_128_64',
         per_device_train_batch_size=batch_size,
         per_device_eval_batch_size=batch_size,
         learning_rate=5e-4,
