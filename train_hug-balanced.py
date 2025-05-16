@@ -1,38 +1,28 @@
-## train_hug.py
 import os
 import random
 import numpy as np
 import torch
+from torch.utils.data import DataLoader
 from transformers import Trainer, TrainingArguments, EarlyStoppingCallback
 from sklearn.metrics import roc_auc_score, average_precision_score
 from dataset_hug import build_arrow_from_pickle, load_arrow_dataset
 from model_hug import RNACrossAttentionHF, RNACrossAttentionConfig
 import gc
 
+os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
-os.environ["CUDA_DEVICE_ORDER"]="PCI_BUS_ID"
-os.environ["CUDA_VISIBLE_DEVICES"]="0"
-
+# ---------------- GPU/Memory utilities ----------------
 def free_memory():
     """
     Frees up unused GPU and CPU memory.
     Call this whenever you’ve deleted large tensors/models
     and want to reclaim space immediately.
     """
-    # 1. Delete any Python references to large tensors/models
-    #    For example, if you’ve just finished with `outputs` or `loss`:
-    # del outputs, loss
-
-    # 2. Run garbage collection on Python side
     gc.collect()
-
-    # 3. Release unreferenced CUDA memory
     torch.cuda.empty_cache()
 
-    # 4. (Optional) synchronize to ensure all kernels have finished
-    #if torch.cuda.is_available():
-    #    torch.cuda.synchronize()
-
+# ---------------- Metrics & Callbacks ----------------
 def compute_metrics(eval_pred):
     logits, labels = eval_pred
     probs = torch.sigmoid(torch.tensor(logits)).numpy()
@@ -41,7 +31,6 @@ def compute_metrics(eval_pred):
         'auroc': roc_auc_score(labels, probs),
         'auprc': average_precision_score(labels, probs)
     }
-
 
 class SaveBestModelCallback(EarlyStoppingCallback):
     def __init__(self, early_stopping_patience: int = 2):
@@ -60,9 +49,9 @@ class SaveBestModelCallback(EarlyStoppingCallback):
             print(f"New best AUPRC: {current:.4f}. Model saved to {save_path}")
         return control
 
-
+# ---------------- Collation ----------------
 def collate_fn(batch):
-    # Batch is list of dicts with torch.Tensor fields
+    # Batch: list of dicts containing torch.Tensors
     As = [item['embA'] for item in batch]
     Bs = [item['embB'] for item in batch]
     lensA = torch.tensor([item['lenA'].item() for item in batch], dtype=torch.long)
@@ -70,7 +59,7 @@ def collate_fn(batch):
     labels = torch.tensor([item['label'].item() for item in batch], dtype=torch.float)
 
     Bsz = len(As)
-    maxA, maxB = lensA.max().item(), lensB.max().item()
+    maxA, maxB = int(lensA.max()), int(lensB.max())
     D = As[0].size(1)
 
     padA = torch.zeros((Bsz, maxA, D), dtype=torch.float)
@@ -87,7 +76,73 @@ def collate_fn(batch):
 
     return {'A': padA, 'B': padB, 'maskA': maskA, 'maskB': maskB, 'labels': labels}
 
+# ---------------- Balanced Sampler ----------------
+class BalancedBatchSampler:
+    """
+    Sampler yielding batches with a fixed ratio of negatives (without replacement)
+    and positives (with replacement).
+    """
+    def __init__(self, labels, batch_size, neg_batch_ratio=0.7):
+        # labels: numpy array or tensor
+        self.labels = labels.numpy() if torch.is_tensor(labels) else np.array(labels)
+        self.batch_size = batch_size
+        self.neg_batch_ratio = neg_batch_ratio
 
+        # indices per class
+        self.neg_indices = np.where(self.labels == 0)[0]
+        self.pos_indices = np.where(self.labels == 1)[0]
+
+        # counts per batch
+        self.num_neg = int(batch_size * neg_batch_ratio)
+        self.num_pos = batch_size - self.num_neg
+
+        # number of batches per epoch
+        full = len(self.neg_indices) // self.num_neg
+        rem = len(self.neg_indices) % self.num_neg
+        self.num_batches = full + (1 if rem > 0 else 0)
+        self.leftover = rem
+
+    def __iter__(self):
+        neg_perm = np.random.permutation(self.neg_indices)
+        start = 0
+        for i in range(self.num_batches):
+            # negatives for this batch
+            if i == self.num_batches - 1 and self.leftover:
+                neg_count = self.leftover
+            else:
+                neg_count = self.num_neg
+            neg_batch = neg_perm[start:start+neg_count]
+            start += neg_count
+
+            # positives with replacement
+            pos_batch = np.random.choice(self.pos_indices, self.batch_size - neg_count, replace=True)
+
+            batch = np.concatenate([neg_batch, pos_batch])
+            np.random.shuffle(batch)
+            yield batch.tolist()
+
+    def __len__(self):
+        return self.num_batches
+
+# ---------------- Custom Trainer ----------------
+class BalancedTrainer(Trainer):
+    def get_train_dataloader(self):
+        # Extract labels array from HuggingFace Dataset
+        labels = np.array(self.train_dataset['label'])
+        sampler = BalancedBatchSampler(
+            labels=labels,
+            batch_size=self.args.per_device_train_batch_size,
+            neg_batch_ratio=0.7
+        )
+        return DataLoader(
+            self.train_dataset,
+            batch_sampler=sampler,
+            collate_fn=collate_fn,
+            num_workers=self.args.dataloader_num_workers,
+            pin_memory=self.args.dataloader_pin_memory,
+        )
+
+# ---------------- Main script ----------------
 def main(
     max_examples: int = None,
     k: int = 128,
@@ -105,39 +160,35 @@ def main(
     if not os.path.exists(arrow_dir):
         print('Building dataset')
         build_arrow_from_pickle(pickle_file, arrow_dir, k=k, stride=stride, max_examples=max_examples)
-
     free_memory()
 
-    # Load full dataset in-memory and split
     print('Loading dataset')
     ds = load_arrow_dataset(arrow_dir, streaming=False)
     if max_examples:
         ds = ds.select(range(min(max_examples, len(ds))))
-
     free_memory()
 
     print('Splitting dataset')
     split = ds.train_test_split(test_size=test_ratio, seed=seed)
     train_ds, eval_ds = split['train'], split['test']
-
     free_memory()
 
-    # Ensure columns available as torch tensors
+    # format for torch
     cols = ['embA', 'embB', 'lenA', 'lenB', 'label']
     train_ds.set_format(type='torch', columns=cols)
     eval_ds.set_format(type='torch', columns=cols)
 
-    # Initialize model and training args
+    # model config
     config = RNACrossAttentionConfig()
     model = RNACrossAttentionHF(config)
 
     total = len(train_ds)
     batch_size, epochs = 2048, 30
-    steps = ((total + batch_size - 1) // batch_size) * epochs
-    steps_per_epoch = ((total + batch_size - 1) // batch_size)
+    steps_per_epoch = (total + batch_size - 1) // batch_size
+    max_steps = steps_per_epoch * epochs
 
     training_args = TrainingArguments(
-        output_dir='./hf_rna_cross_full_dataloaderplustest_128_64',
+        output_dir='./hf_rna_cross_fullbalanced__128_64',
         per_device_train_batch_size=batch_size,
         per_device_eval_batch_size=batch_size,
         learning_rate=5e-4,
@@ -152,12 +203,12 @@ def main(
         load_best_model_at_end=True,
         remove_unused_columns=False,
         save_total_limit=3,
-        max_steps=steps,
-        dataloader_num_workers=6, # new
-        dataloader_pin_memory=True # new
+        max_steps=max_steps,
+        dataloader_num_workers=6,
+        dataloader_pin_memory=True,
     )
 
-    trainer = Trainer(
+    trainer = BalancedTrainer(
         model=model,
         args=training_args,
         train_dataset=train_ds,
@@ -166,15 +217,11 @@ def main(
         compute_metrics=compute_metrics,
         callbacks=[SaveBestModelCallback()]
     )
-    
+
     print('Begin Training')
     free_memory()
     trainer.train()
-    print(f'Training complete. Best model in {output_dir}')
-
+    print(f'Training complete. Best model saved in {training_args.output_dir}/best_model')
 
 if __name__ == '__main__':
-    #main(max_examples=100)
     main()
-
-
